@@ -17,6 +17,33 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class AccountSpec:
+    ids: tuple[str, ...]        # XBRL account_id (1순위)
+    names: tuple[str, ...]      # 계정명 정확 일치 (2순위, 공백 무시)
+    sj_divs: tuple[str, ...]    # 찾을 재무제표 구분
+
+
+_BS = ("BS",)
+_IS = ("IS", "CIS")
+_CF = ("CF",)
+ACCOUNT_SPECS: dict[str, AccountSpec] = {
+    "current_assets": AccountSpec(("ifrs-full_CurrentAssets",), ("유동자산",), _BS),
+    "current_liabilities": AccountSpec(("ifrs-full_CurrentLiabilities",), ("유동부채",), _BS),
+    "total_liabilities": AccountSpec(("ifrs-full_Liabilities",), ("부채총계",), _BS),
+    "total_equity": AccountSpec(("ifrs-full_Equity",), ("자본총계",), _BS),
+    "cash": AccountSpec(("ifrs-full_CashAndCashEquivalents",), ("현금및현금성자산",), _BS),
+    "revenue": AccountSpec(("ifrs-full_Revenue",), ("매출액", "영업수익", "수익(매출액)", "매출"), _IS),
+    "operating_income": AccountSpec(("dart_OperatingIncomeLoss",), ("영업이익", "영업이익(손실)", "영업손실"), _IS),
+    "operating_cash_flow": AccountSpec(
+        ("ifrs-full_CashFlowsFromUsedInOperatingActivities",),
+        ("영업활동현금흐름", "영업활동으로인한현금흐름", "영업활동으로부터의현금흐름"),
+        _CF,
+    ),
+    "rd_expense": AccountSpec((), ("연구개발비", "경상연구개발비"), _IS),
+}
+
+
+@dataclass(frozen=True)
 class DartCompanyData:
     financial: FinancialData | None
     disclosure: DisclosureData
@@ -108,7 +135,7 @@ class DartClient:
                 if financial:
                     if financial.rd_expense_ratio is None:
                         rcept_no = next((str(r.get("rcept_no")) for r in rows if r.get("rcept_no")), "")
-                        revenue = self._find_amount(rows, ("매출액", "영업수익", "수익(매출액)"))
+                        revenue = self._find_amount(rows, "revenue")
                         found = (
                             self._rd_ratio_from_business_report(corp_code, year, rcept_no, revenue)
                             if rcept_no else None
@@ -246,15 +273,15 @@ class DartClient:
         return payload.get("list", []) or []
 
     def _to_financial_data(self, rows: list[dict]) -> FinancialData | None:
-        current_assets = self._find_amount(rows, ("유동자산",))
-        current_liabilities = self._find_amount(rows, ("유동부채",))
-        total_liabilities = self._find_amount(rows, ("부채총계",))
-        total_equity = self._find_amount(rows, ("자본총계",))
-        revenue = self._find_amount(rows, ("매출액", "영업수익", "수익(매출액)"))
-        operating_income = self._find_amount(rows, ("영업이익",))
-        operating_cash_flow = self._find_amount(rows, ("영업활동현금흐름", "영업활동으로 인한 현금흐름"))
-        cash_assets = self._find_amount(rows, ("현금및현금성자산", "현금 및 현금성자산"))
-        rd_expense = self._find_amount(rows, ("연구개발비", "경상연구개발비"))
+        current_assets = self._find_amount(rows, "current_assets")
+        current_liabilities = self._find_amount(rows, "current_liabilities")
+        total_liabilities = self._find_amount(rows, "total_liabilities")
+        total_equity = self._find_amount(rows, "total_equity")
+        revenue = self._find_amount(rows, "revenue")
+        operating_income = self._find_amount(rows, "operating_income")
+        operating_cash_flow = self._find_amount(rows, "operating_cash_flow")
+        cash_assets = self._find_amount(rows, "cash")
+        rd_expense = self._find_amount(rows, "rd_expense")
 
         if not any((current_assets, total_liabilities, revenue, operating_income, cash_assets)):
             return None
@@ -416,22 +443,28 @@ class DartClient:
         return found, hits
 
     @staticmethod
-    def _find_amount(rows: list[dict], names: tuple[str, ...]) -> float | None:
-        candidates: list[tuple[int, float]] = []
-        for row in rows:
-            account = str(row.get("account_nm", ""))
-            if not any(name in account for name in names):
-                continue
-            amount = DartClient._parse_amount(row.get("thstrm_amount"))
-            if amount is None:
-                continue
-            sj_div = str(row.get("sj_div", ""))
-            priority = 0 if sj_div in {"BS", "IS", "CIS", "CF"} else 1
-            candidates.append((priority, amount))
-        if not candidates:
+    def _find_amount(rows: list[dict], account: str) -> float | None:
+        """계정 금액(당기). 1순위 account_id 일치, 2순위 계정명 정확 일치(공백 무시).
+
+        부분 문자열 매칭은 쓰지 않는다 — '부채총계'가 '자본과부채총계'에, '유동자산'이
+        '비유동자산'에, '현금및현금성자산'이 '기말현금및현금성자산'에 걸리기 때문.
+        """
+        spec = ACCOUNT_SPECS[account]
+        statement_rows = [r for r in rows if str(r.get("sj_div", "")) in spec.sj_divs]
+
+        def first_amount(match) -> float | None:
+            for row in statement_rows:
+                if match(row):
+                    amount = DartClient._parse_amount(row.get("thstrm_amount"))
+                    if amount is not None:
+                        return amount
             return None
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+
+        by_id = first_amount(lambda r: str(r.get("account_id", "")).strip() in spec.ids) if spec.ids else None
+        if by_id is not None:
+            return by_id
+        names = {re.sub(r"\s+", "", n) for n in spec.names}
+        return first_amount(lambda r: re.sub(r"\s+", "", str(r.get("account_nm", ""))) in names)
 
     @staticmethod
     def _parse_amount(value: object) -> float | None:
