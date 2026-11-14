@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
+from datetime import datetime
 from html import escape
 from typing import Any
 
@@ -33,7 +35,8 @@ from agents import (
     supervisory_review_node,
 )
 from data.company_loader import build_companies_by_id, load_companies
-from models.schemas import BioAgentState, CompanyReport, GradeEnum, NewsResult, SupervisoryResult
+from services.llm_client import get_llm_api_key, get_llm_model
+from models.schemas import BioAgentState, CompanyData, CompanyReport, GradeEnum, NewsResult, SupervisoryResult
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -82,8 +85,8 @@ def news_node(state: dict) -> dict:
         or os.environ.get("NAVER_NEWS_API_Client_ID", "").strip(),
         "naver_client_secret": os.environ.get("NAVER_CLIENT_SECRET", "").strip()
         or os.environ.get("NAVER_NEWS_API_Client_Secret", "").strip(),
-        "openai_api_key": os.environ.get("OPENAI_API_KEY", "").strip(),
-        "openai_model": os.environ.get("OPENAI_MODEL", "gpt-5.4-mini").strip(),
+        "llm_api_key": get_llm_api_key(),
+        "llm_model": get_llm_model(),
         "errors": list(s.errors),
     }
     result = _news_node_fn(flat)
@@ -99,6 +102,9 @@ def news_node(state: dict) -> dict:
         negative_keywords=negative_keywords,
         negative_critical_event=bool(detail.get("neg_high", [])),
         missing_news=result.get("news_score") is None,
+        negative_high_keywords=list(detail.get("neg_high", [])),
+        negative_mid_keywords=list(detail.get("neg_mid", [])),
+        llm_status=detail.get("llm_status", ""),
         keyword_score=detail.get("keyword_score"),
         keyword_hits=detail.get("keyword_hits", 0),
         llm_score=detail.get("llm_score"),
@@ -130,15 +136,21 @@ def supervisory_node(state: dict) -> dict:
     disc_level = s.disclosure_result.disclosure_risk_level.value if s.disclosure_result else "MEDIUM"
     flat = {
         "company_name": s.company_data.company_name,
-        "openai_api_key": os.environ.get("OPENAI_API_KEY", "").strip(),
-        "openai_model": os.environ.get("OPENAI_MODEL", "gpt-5.4-mini").strip(),
+        "llm_api_key": get_llm_api_key(),
+        "llm_model": get_llm_model(),
         "loan_grade": s.risk_score_result.grade.value if s.risk_score_result else "",
         "financial_score": s.financial_result.financial_score if s.financial_result else None,
         "news_score": s.news_result.news_score if s.news_result else None,
         "bio_domain_score": s.bio_domain_result.bio_domain_score if s.bio_domain_result else None,
         "bio_score": s.bio_domain_result.bio_domain_score if s.bio_domain_result else None,
         "disclosure_score": disc_score_map.get(disc_level, 60.0),
-        "news_detail": {"neg_high": s.news_result.negative_keywords if s.news_result else []},
+        "disclosure_data_missing": bool(s.disclosure_result and s.disclosure_result.lookup_failed),
+        # neg_high에는 강한 부정 키워드만, 중간 부정은 neg_mid로 분리해서 전달
+        "news_detail": {
+            "neg_high": s.news_result.negative_high_keywords if s.news_result else [],
+            "neg_mid": s.news_result.negative_mid_keywords if s.news_result else [],
+            "positives": s.news_result.positive_keywords if s.news_result else [],
+        },
         "news_summary": s.news_result.llm_summary if s.news_result else "",
         "restart_count": s.restart_count,
         "errors": list(s.errors),
@@ -234,10 +246,12 @@ def _run_all_analyses(generation: int) -> None:
     _REPORTS.clear()
 
     logger.info("KOSDAQ top company analysis started (%d companies)", len(_COMPANIES))
+    superseded = False
     try:
         for company in _COMPANIES:
             if generation != _analysis_task_generation:
                 logger.info("KOSDAQ analysis superseded by new run (%d/%d complete)", len(_REPORTS), len(_COMPANIES))
+                superseded = True
                 break
             try:
                 report = analyze_company(company)
@@ -250,9 +264,60 @@ def _run_all_analyses(generation: int) -> None:
                 )
             except Exception as exc:
                 logger.error("analysis failed [%s]: %s", company.company_id, exc)
+        # 끝까지 돈 실행만 저장 (중간에 새 실행으로 대체된 경우는 저장하지 않음)
+        if not superseded and _REPORTS:
+            _save_reports()
     finally:
         if generation == _analysis_task_generation:
             _analysis_started = False
+
+
+# ── 분석 결과 저장/불러오기 (Gemini 무료 쿼터 절약용) ──────────────
+def _saved_reports_path() -> str:
+    return os.getenv("SAVED_REPORTS_PATH", "").strip() or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".cache", "saved_reports.json"
+    )
+
+
+def _save_reports() -> None:
+    path = _saved_reports_path()
+    payload = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "companies": [company.model_dump(mode="json") for company in _COMPANIES],
+        "reports": [report.model_dump(mode="json") for report in _REPORTS.values()],
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        logger.info("[Reports] saved %d reports -> %s", len(_REPORTS), path)
+    except Exception as exc:
+        logger.error("[Reports] save failed (%s): %s", path, exc)
+
+
+def _load_saved_reports() -> bool:
+    global _COMPANIES, COMPANIES_BY_ID
+    path = _saved_reports_path()
+    if not os.path.exists(path):
+        logger.info("[Reports] USE_SAVED_REPORTS=true but no saved file: %s", path)
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        companies = [CompanyData(**item) for item in payload.get("companies", [])]
+        reports = [CompanyReport(**item) for item in payload.get("reports", [])]
+    except Exception as exc:
+        logger.error("[Reports] saved file load failed (%s): %s", path, exc)
+        return False
+    _COMPANIES = companies
+    COMPANIES_BY_ID = build_companies_by_id(companies)
+    _REPORTS.clear()
+    _REPORTS.update({report.company_id: report for report in reports})
+    logger.info("[Reports] loaded %d saved reports (saved_at=%s) from %s",
+                len(reports), payload.get("saved_at"), path)
+    return True
 
 
 app = FastAPI(title="BioCredit Agent", version="1.0.0")
@@ -260,6 +325,8 @@ app = FastAPI(title="BioCredit Agent", version="1.0.0")
 
 @app.on_event("startup")
 async def startup_analyses() -> None:
+    if os.getenv("USE_SAVED_REPORTS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _load_saved_reports()
     logger.info("[Startup] server ready; analysis waits for the dashboard start button")
 
 
@@ -296,6 +363,12 @@ def _fmt_score(value: float | None) -> str:
 
 def _safe_join(items: list[str]) -> str:
     return ", ".join(items) if items else "없음"
+
+
+def _disc_text(report: CompanyReport) -> str:
+    if report.disclosure_lookup_failed:
+        return "공시 조회 실패"
+    return report.disclosure_risk_level.value
 
 
 def _market_cap_text(value: float | None) -> str:
@@ -353,7 +426,7 @@ async def main_page() -> HTMLResponse:
           <td class="num">{report.financial_score:.1f}</td>
           <td class="num"><button class="score-btn" type="button" data-panel="{panel_id}">{news_str}</button></td>
           <td class="num">{report.bio_score:.1f}</td>
-          <td>{escape(report.disclosure_risk_level.value)}</td>
+          <td>{escape(_disc_text(report))}</td>
           <td>{special_text}</td>
           <td><span class="decision" style="background:{decision_color}">{decision_label}</span></td>
           <td><a class="btn-detail" href="/companies/{report.company_id}">상세보기</a></td>
@@ -364,7 +437,8 @@ async def main_page() -> HTMLResponse:
         panel_id = f"news-{report.company_id}"
         news_str = _fmt_score(report.news_score)
         positive = escape(_safe_join(report.news_positive_keywords))
-        negative = escape(_safe_join(report.news_negative_keywords))
+        neg_high = escape(_safe_join(report.news_negative_high_keywords))
+        neg_mid = escape(_safe_join(report.news_negative_mid_keywords))
         llm_summary = escape(report.news_llm_summary or "없음")
         merge_weights = escape(report.news_merge_weights or "없음")
         critical = "감지됨" if report.news_negative_critical_event else "없음"
@@ -379,7 +453,8 @@ async def main_page() -> HTMLResponse:
           </div>
           <ul>
             <li><strong>긍정 키워드:</strong> {positive}</li>
-            <li><strong>부정 키워드:</strong> {negative}</li>
+            <li><strong>강한 부정 키워드:</strong> {neg_high}</li>
+            <li><strong>중간 부정 키워드:</strong> {neg_mid}</li>
             <li><strong>중대 부정 이벤트:</strong> {critical}</li>
             <li><strong>병합 가중치:</strong> {merge_weights}</li>
             <li><strong>LLM 요약:</strong> {llm_summary}</li>
@@ -404,7 +479,7 @@ async def main_page() -> HTMLResponse:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BioCredit Agent - KOSDAQ Top 50</title>
+<title>BioCredit Agent - KOSDAQ Top {total_companies}</title>
 <style>
   * {{ box-sizing: border-box; }}
   body {{ margin:0; font-family:'Segoe UI', Arial, sans-serif; background:#eef3f8; color:#253044; }}
@@ -470,7 +545,7 @@ async def main_page() -> HTMLResponse:
 <body>
 <header>
   <h1>BioCredit Agent</h1>
-  <p>코스닥 상위 50개 기업 신용 분석 대시보드</p>
+  <p>코스닥 바이오·제약 상위 {total_companies}개 기업 신용 분석 대시보드</p>
 </header>
 <div class="action-panel">
   <span id="analysis-state">{"분석 중" if _analysis_started else "대기 중"}</span>
@@ -520,7 +595,7 @@ async def main_page() -> HTMLResponse:
   </div>
   <div id="news-panels">{panels}</div>
 </div>
-<footer>BioCredit Agent v1.0 · KOSDAQ Top 50 · FastAPI</footer>
+<footer>BioCredit Agent v1.0 · KOSDAQ Top {total_companies} · FastAPI</footer>
 <script>
   document.querySelectorAll('.score-btn').forEach((button) => {{
     button.addEventListener('click', () => {{
@@ -618,9 +693,24 @@ async def company_detail(company_id: str) -> HTMLResponse:
     bio_summary = escape(report.bio_domain_summary or "없음")
     news_summary = escape(report.news_llm_summary or "없음")
     positive = escape(_safe_join(report.news_positive_keywords))
-    negative = escape(_safe_join(report.news_negative_keywords))
+    neg_high = escape(_safe_join(report.news_negative_high_keywords))
+    neg_mid = escape(_safe_join(report.news_negative_mid_keywords))
     financial_risks = escape(_safe_join(report.financial_risk_factors))
     disclosure_keywords = escape(_safe_join(report.disclosure_detected_keywords))
+    disclosure_errors = escape(_safe_join(report.disclosure_data_errors))
+    if report.disclosure_matched:
+        disclosure_rows = "".join(
+            f'<tr class="{"applied" if hit.applied else "excluded"}">'
+            f"<td>{escape(hit.date[:4] + '-' + hit.date[4:6] + '-' + hit.date[6:] if len(hit.date) == 8 else hit.date)}</td>"
+            f"<td>{escape(hit.title)}</td><td>{escape(hit.keyword)}</td><td>{escape(hit.note)}</td></tr>"
+            for hit in report.disclosure_matched
+        )
+        disclosure_table = (
+            '<table class="disc"><thead><tr><th>접수일</th><th>공시 제목</th><th>키워드</th><th>처리</th></tr></thead>'
+            f"<tbody>{disclosure_rows}</tbody></table>"
+        )
+    else:
+        disclosure_table = '<p class="muted">키워드에 걸린 공시 제목이 없습니다.</p>'
 
     html = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -646,6 +736,13 @@ async def company_detail(company_id: str) -> HTMLResponse:
   .evidence-panel {{ display:none; }}
   .evidence-panel.active {{ display:block; }}
   ul {{ line-height:1.7; padding-left:20px; }}
+  h3 {{ font-size:.95rem; margin:16px 0 8px; }}
+  .muted {{ color:#718096; }}
+  table.disc {{ width:100%; border-collapse:collapse; font-size:.84rem; }}
+  table.disc th {{ background:#f7fafc; color:#607086; text-align:left; padding:8px 10px; border-bottom:2px solid #dce6f0; }}
+  table.disc td {{ padding:8px 10px; border-bottom:1px solid #edf2f7; vertical-align:top; }}
+  table.disc tr.applied td:last-child {{ color:#9b1c1c; font-weight:700; }}
+  table.disc tr.excluded td {{ color:#8a97a8; }}
 </style>
 </head>
 <body>
@@ -673,8 +770,9 @@ async def company_detail(company_id: str) -> HTMLResponse:
       <li><strong>재무 점수:</strong> {report.financial_score:.1f}</li>
       <li><strong>뉴스 점수:</strong> {news_str}</li>
       <li><strong>바이오 점수:</strong> {report.bio_score:.1f}</li>
-      <li><strong>공시 리스크:</strong> {escape(report.disclosure_risk_level.value)}</li>
+      <li><strong>공시 리스크:</strong> {escape(_disc_text(report))}</li>
       <li><strong>특이사항:</strong> {"있음" if report.special_case else "없음"}</li>
+      <li><strong>LLM 호출:</strong> 뉴스 {escape(report.llm_status.get("news", "-"))} · Supervisory {escape(report.llm_status.get("supervisory", "-"))} · 보고서 {escape(report.llm_status.get("report", "-"))}</li>
     </ul>
   </section>
   <section class="card evidence-panel" id="news-evidence">
@@ -685,7 +783,8 @@ async def company_detail(company_id: str) -> HTMLResponse:
       <li><strong>LLM 점수:</strong> {_fmt_score(report.news_llm_score)}</li>
       <li><strong>키워드 적중:</strong> {report.news_keyword_hits}</li>
       <li><strong>긍정 키워드:</strong> {positive}</li>
-      <li><strong>부정 키워드:</strong> {negative}</li>
+      <li><strong>강한 부정 키워드:</strong> {neg_high}</li>
+            <li><strong>중간 부정 키워드:</strong> {neg_mid}</li>
       <li><strong>중대 부정 이벤트:</strong> {"감지됨" if report.news_negative_critical_event else "없음"}</li>
       <li><strong>병합 가중치:</strong> {escape(report.news_merge_weights or "없음")}</li>
       <li><strong>LLM 요약:</strong> {news_summary}</li>
@@ -695,17 +794,23 @@ async def company_detail(company_id: str) -> HTMLResponse:
     <h2>재무제표 분석 근거</h2>
     <ul>
       <li><strong>재무 점수:</strong> {report.financial_score:.1f}</li>
+      <li><strong>R&amp;D 비중:</strong> {escape(report.rd_expense_text)}</li>
+      <li><strong>R&amp;D 출처:</strong> {escape(report.rd_source_text)}</li>
+      <li><strong>Cash Runway:</strong> {escape(report.cash_runway_text)}</li>
       <li><strong>위험 요인:</strong> {financial_risks}</li>
-      <li><strong>공시 리스크 영향:</strong> {escape(report.disclosure_risk_level.value)}</li>
+      <li><strong>공시 리스크 영향:</strong> {escape(_disc_text(report))}</li>
     </ul>
   </section>
   <section class="card evidence-panel" id="bio-evidence"><h2>바이오 분석 근거</h2><p>{bio_summary}</p></section>
   <section class="card">
     <h2>공시 리스크 근거</h2>
     <ul>
-      <li><strong>공시 리스크:</strong> {escape(report.disclosure_risk_level.value)}</li>
+      <li><strong>공시 리스크:</strong> {escape(_disc_text(report))}</li>
       <li><strong>감지 키워드:</strong> {disclosure_keywords}</li>
+      <li><strong>데이터 조회 오류:</strong> {disclosure_errors}</li>
     </ul>
+    <h3>키워드 매칭 공시 (최근 1년)</h3>
+    {disclosure_table}
   </section>
   <section class="card"><h2>Report</h2><div class="report">{report_html}</div></section>
 </main>

@@ -24,14 +24,50 @@ class FinalDecision(str, Enum):
     HUMAN_IN_THE_LOOP = "HUMAN_IN_THE_LOOP"
 
 
+class CashRunwayStatus(str, Enum):
+    BURN = "BURN"          # 영업현금흐름 음수 → 소진 개월 수 산출
+    NO_BURN = "NO_BURN"    # 영업현금흐름 0 이상 → 현금 소진 없음
+    UNKNOWN = "UNKNOWN"    # 영업현금흐름(또는 현금) 데이터 없음
+
+
 class FinancialData(BaseModel):
     current_ratio: float
     debt_ratio: float
-    operating_cash_flow: float
+    operating_cash_flow: Optional[float]          # 억원, None = 데이터 없음
     cash_assets: float
-    cash_runway_months: float
-    operating_profit_margin: float  # 영업이익률 (%)
-    rd_expense_ratio: float         # R&D 비용 비중 (%)
+    cash_runway_months: Optional[float]           # BURN일 때만 값 존재
+    operating_profit_margin: float                # 영업이익률 (%)
+    rd_expense_ratio: Optional[float]             # R&D 비용 비중 (%), None = 데이터 없음
+    rd_source: str = ""                           # R&D 비중 출처
+    cash_runway_status: Optional[CashRunwayStatus] = None
+
+    @property
+    def runway_status(self) -> CashRunwayStatus:
+        if self.cash_runway_status is not None:
+            return self.cash_runway_status
+        return CashRunwayStatus.BURN if self.cash_runway_months is not None else CashRunwayStatus.UNKNOWN
+
+    @property
+    def runway_text(self) -> str:
+        status = self.runway_status
+        if status == CashRunwayStatus.BURN and self.cash_runway_months is not None:
+            return f"{self.cash_runway_months:.1f}개월"
+        if status == CashRunwayStatus.NO_BURN:
+            return "현금 소진 없음"
+        return "데이터 없음"
+
+    @property
+    def rd_text(self) -> str:
+        if self.rd_expense_ratio is None:
+            return "데이터 없음"
+        return f"{self.rd_expense_ratio:.2f}%"
+
+    @property
+    def rd_source_text(self) -> str:
+        """재무제표 / 사업보고서 (...) / 데이터 없음"""
+        if self.rd_expense_ratio is None:
+            return "데이터 없음"
+        return self.rd_source or "입력값"
 
 
 class NewsItem(BaseModel):
@@ -48,8 +84,19 @@ class BioDomainData(BaseModel):
     core_pipeline_dependency: float
 
 
+class DisclosureHit(BaseModel):
+    """공시 제목 1건에 대한 키워드 매칭 결과."""
+    date: str = ""
+    title: str
+    keyword: str
+    applied: bool            # True = 리스크로 반영, False = 제외
+    note: str = ""           # 반영/제외 사유
+
+
 class DisclosureData(BaseModel):
     risk_keywords: list[str]
+    matched_disclosures: list[DisclosureHit] = Field(default_factory=list)
+    data_errors: list[str] = Field(default_factory=list)   # 'DART disclosure unavailable' 등
 
 
 class CompanyData(BaseModel):
@@ -78,9 +125,12 @@ class FinancialResult(BaseModel):
 class NewsResult(BaseModel):
     news_score: Optional[float]
     positive_keywords: list[str]
-    negative_keywords: list[str]
+    negative_keywords: list[str]                     # 강한 + 중간 부정 (합집합)
     negative_critical_event: bool
     missing_news: bool
+    negative_high_keywords: list[str] = Field(default_factory=list)   # 강한 부정 (NEG_HIGH)
+    negative_mid_keywords: list[str] = Field(default_factory=list)    # 중간 부정 (NEG_MID)
+    llm_status: str = ""                                              # 성공 / 실패 / 미호출(...)
     keyword_score: Optional[float] = None
     keyword_hits: int = 0
     llm_score: Optional[float] = None
@@ -103,6 +153,9 @@ class BioDomainResult(BaseModel):
 class DisclosureResult(BaseModel):
     disclosure_risk_level: DisclosureRiskLevel
     detected_keywords: list[str]
+    matched_disclosures: list[DisclosureHit] = Field(default_factory=list)
+    data_errors: list[str] = Field(default_factory=list)
+    lookup_failed: bool = False          # 공시 조회 실패 (MEDIUM 처리 + 전문가 검토)
 
 
 class RiskScoreResult(BaseModel):
@@ -153,6 +206,16 @@ class CompanyReport(BaseModel):
     bio_domain_risks: list[str] = Field(default_factory=list)
     bio_domain_summary: str = ""
     disclosure_detected_keywords: list[str] = Field(default_factory=list)
+    disclosure_matched: list[DisclosureHit] = Field(default_factory=list)
+    disclosure_data_errors: list[str] = Field(default_factory=list)
+    disclosure_lookup_failed: bool = False
+    rd_expense_text: str = "데이터 없음"
+    rd_source_text: str = "데이터 없음"
+    cash_runway_text: str = "데이터 없음"
+    news_negative_high_keywords: list[str] = Field(default_factory=list)
+    news_negative_mid_keywords: list[str] = Field(default_factory=list)
+    # LLM 호출 결과: {"news": ..., "supervisory": ..., "report": ...} → 성공 / 실패 / 미호출(사유)
+    llm_status: dict[str, str] = Field(default_factory=dict)
 
 
 class BioAgentState(BaseModel):

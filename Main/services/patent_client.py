@@ -65,6 +65,7 @@ class PatentClient:
         params = {
             "accessKey": self._api_key,
             "serviceKey": self._api_key,
+            "ServiceKey": self._api_key,  # kipo-api (getAdvancedSearch 등)
             "applicantName": applicant_name,
             "applicant": applicant_name,
             "query": applicant_name,
@@ -125,6 +126,9 @@ class PatentClient:
 
     def _from_json(self, payload: Any) -> PatentSummary:
         values = list(self._walk(payload))
+        error = self._api_error(values)
+        if error:
+            return PatentSummary(source_available=False, message=error)
         patent_count = self._first_int(values, ("totalCount", "count", "patentCount", "numOfRows"))
         status_text = " ".join(str(value) for _, value in values)
         registered_count = self._count_status(status_text, ("registration", "registered", "등록"))
@@ -140,6 +144,9 @@ class PatentClient:
         try:
             root = ElementTree.fromstring(text)
             values = [(elem.tag, elem.text or "") for elem in root.iter()]
+            error = self._api_error(values)
+            if error:
+                return PatentSummary(source_available=False, message=error)
             patent_count = self._first_int(values, ("totalCount", "count", "patentCount", "numOfRows"))
             status_text = " ".join(value for _, value in values)
         except Exception:
@@ -156,6 +163,17 @@ class PatentClient:
         )
 
     @staticmethod
+    def _api_error(values: list[tuple[str, Any]]) -> str:
+        """KIPRIS header의 resultCode가 정상(빈 값/00)이 아니면 오류 메시지를 반환."""
+        fields = {key.lower(): str(value).strip() for key, value in values if not isinstance(value, (dict, list))}
+        code = fields.get("resultcode", "")
+        if code and code not in ("00", "0"):
+            msg = fields.get("resultmsg", "")
+            logger.warning("[Patent] KIPRIS error resultCode=%s %s", code, msg)
+            return f"KIPRIS error {code}: {msg}".strip()
+        return ""
+
+    @staticmethod
     def _walk(payload: Any) -> list[tuple[str, Any]]:
         items: list[tuple[str, Any]] = []
         if isinstance(payload, dict):
@@ -169,13 +187,15 @@ class PatentClient:
 
     @staticmethod
     def _first_int(values: list[tuple[str, Any]], names: tuple[str, ...]) -> int:
-        lowered = {name.lower() for name in names}
-        for key, value in values:
-            if key.lower() in lowered:
-                try:
-                    return int(str(value).replace(",", "").strip())
-                except ValueError:
-                    continue
+        # names 순서대로 우선 탐색 (kipo-api 응답은 numOfRows가 totalCount보다 앞에 나옴)
+        for name in names:
+            target = name.lower()
+            for key, value in values:
+                if key.lower() == target:
+                    try:
+                        return int(str(value).replace(",", "").strip())
+                    except ValueError:
+                        continue
         return 0
 
     @staticmethod

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 
-from models.schemas import BioDomainData, CompanyData, DisclosureData, FinancialData
+from models.schemas import BioDomainData, CashRunwayStatus, CompanyData, DisclosureData, FinancialData
 from services.dart_client import get_dart_client
 from services.market_client import MarketCompany, get_market_client
 
@@ -14,7 +14,7 @@ def load_companies(limit: int | None = None) -> list[CompanyData]:
     limit = limit or int(os.getenv("KOSDAQ_TOP_LIMIT", "50"))
     market_companies = get_market_client().get_kosdaq_top_by_market_cap(limit=limit)
     companies = [_to_company_data(item) for item in market_companies]
-    logger.info("[CompanyLoader] loaded %d KOSDAQ companies", len(companies))
+    logger.info("[CompanyLoader] loaded %d KOSDAQ bio/pharma companies", len(companies))
     return companies
 
 
@@ -55,6 +55,8 @@ def _to_company_data(item: MarketCompany) -> CompanyData:
 
 
 def _industry_category(item: MarketCompany) -> str:
+    if item.industry:
+        return item.industry
     if item.department:
         return f"{item.market} / {item.department}"
     return item.market or "KOSDAQ"
@@ -66,11 +68,12 @@ def _default_financial_data() -> FinancialData:
     return FinancialData(
         current_ratio=1.5,
         debt_ratio=70.0,
-        operating_cash_flow=0.0,
+        operating_cash_flow=None,
         cash_assets=100.0,
-        cash_runway_months=12.0,
+        cash_runway_months=None,
+        cash_runway_status=CashRunwayStatus.UNKNOWN,
         operating_profit_margin=0.0,
-        rd_expense_ratio=10.0,
+        rd_expense_ratio=None,
     )
 
 
