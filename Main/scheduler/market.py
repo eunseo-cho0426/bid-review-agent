@@ -20,6 +20,13 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+try:
+    from services.llm_client import get_chat_model, get_llm_api_key, get_llm_model, message_text
+except ImportError:  # python scheduler/market.py 로 직접 실행하는 경우
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from services.llm_client import get_chat_model, get_llm_api_key, get_llm_model, message_text
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
@@ -60,12 +67,12 @@ def _collect_industry_news(
             "display": max_per_keyword,
         }
         headers = {
-            "X-Naver-Client-Id":     client_id,
-            "X-Naver-Client-Secret": client_secret,
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY":    client_secret,
         }
         try:
             resp = requests.get(
-                "https://openapi.naver.com/v1/search/news.json",
+                "https://naverapihub.apigw.ntruss.com/search/v1/news",
                 params=params,
                 headers=headers,
                 timeout=15,
@@ -91,8 +98,8 @@ def _collect_industry_news(
 # ──────────────────────────────────────────────
 def _llm_analyze_industry(
     articles: List[Dict],
-    openai_api_key: str,
-    openai_model: str,
+    llm_api_key: str,
+    llm_model: str,
 ) -> Tuple[Optional[float], str, List[str], List[str]]:
     """
     LLM으로 바이오 산업 환경을 분석한다.
@@ -103,7 +110,7 @@ def _llm_analyze_industry(
         positive : 긍정 요인 목록
         negative : 부정 요인 목록
     """
-    if not articles or not openai_api_key:
+    if not articles or not llm_api_key:
         return None, "", [], []
 
     headlines = "\n".join(
@@ -127,15 +134,9 @@ def _llm_analyze_industry(
     )
 
     try:
-        from langchain_openai import ChatOpenAI
-
-        llm = ChatOpenAI(
-            model=openai_model,
-            openai_api_key=openai_api_key,
-            temperature=0.1,
-        )
+        llm = get_chat_model(api_key=llm_api_key, model=llm_model, temperature=0.1)
         result  = llm.invoke(prompt)
-        content = result.content.strip()
+        content = message_text(result).strip()
 
         if content.startswith("```"):
             content = content.split("```")[1]
@@ -186,8 +187,8 @@ def _save_cache(
 def update_market_score(
     naver_client_id: str     = "",
     naver_client_secret: str = "",
-    openai_api_key: str      = "",
-    openai_model: str        = "gpt-5.4-mini",
+    llm_api_key: str      = "",
+    llm_model: str        = "",
 ) -> None:
     """
     바이오 산업 환경을 분석하고 캐시를 갱신한다.
@@ -204,8 +205,8 @@ def update_market_score(
         or os.getenv("NAVER_CLIENT_SECRET", "")
         or os.getenv("NAVER_NEWS_API_Client_Secret", "")
     )
-    openai_api_key      = openai_api_key      or os.getenv("OPENAI_API_KEY", "")
-    openai_model        = openai_model        or os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+    llm_api_key      = llm_api_key      or get_llm_api_key()
+    llm_model        = llm_model        or get_llm_model()
 
     logger.info("[Market] 산업 환경 분석 시작 — %s", datetime.now().isoformat())
 
@@ -219,7 +220,7 @@ def update_market_score(
 
     # 2) LLM 분석
     score, summary, positive, negative = _llm_analyze_industry(
-        articles, openai_api_key, openai_model
+        articles, llm_api_key, llm_model
     )
 
     if score is None:

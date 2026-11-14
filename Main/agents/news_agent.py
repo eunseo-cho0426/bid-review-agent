@@ -18,6 +18,7 @@ from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from services.llm_client import get_chat_model, get_llm_api_key, get_llm_model, message_text
 from models.schemas import NewsResult
 
 logger = logging.getLogger(__name__)
@@ -79,12 +80,12 @@ def search_naver_news(
             "start": start,
         }
         headers = {
-            "X-Naver-Client-Id":     client_id,
-            "X-Naver-Client-Secret": client_secret,
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY":    client_secret,
         }
         try:
             resp = requests.get(
-                "https://openapi.naver.com/v1/search/news.json",
+                "https://naverapihub.apigw.ntruss.com/search/v1/news",
                 params=params,
                 headers=headers,
                 timeout=15,
@@ -194,8 +195,8 @@ def _keyword_score(
 def _llm_score(
     articles: List[Dict],
     company_name: str,
-    openai_api_key: str,
-    openai_model: str,
+    llm_api_key: str,
+    llm_model: str,
 ) -> Tuple[Optional[float], str]:
     """
     LLM 기반 맥락 분석 점수.
@@ -204,7 +205,7 @@ def _llm_score(
         score   : 0~100 또는 None (실패 시)
         summary : 분석 요약 문장
     """
-    if not articles or not openai_api_key:
+    if not articles or not llm_api_key:
         return None, ""
 
     headlines = "\n".join(
@@ -225,19 +226,12 @@ def _llm_score(
     )
 
     try:
-        from langchain_openai import ChatOpenAI
-
-        llm = ChatOpenAI(
-            model=openai_model,
-            openai_api_key=openai_api_key,
-            temperature=0.1,
-            streaming=True,
-        )
+        llm = get_chat_model(api_key=llm_api_key, model=llm_model, temperature=0.1)
 
         print(f"\n[News LLM Streaming] {company_name} analysis start", flush=True)
         content_parts: List[str] = []
         for chunk in llm.stream(prompt):
-            token = chunk.content or ""
+            token = message_text(chunk)
             if token:
                 print(token, end="", flush=True)
                 content_parts.append(token)
@@ -297,8 +291,8 @@ def _merge_scores(
 def calculate_news_score(
     articles: List[Dict],
     company_name: str,
-    openai_api_key: str = "",
-    openai_model: str   = "gpt-5.4-mini",
+    llm_api_key: str = "",
+    llm_model: str   = "",
 ) -> Tuple[float, Dict, str]:
     """
     전체 뉴스 점수 계산 파이프라인.
@@ -310,7 +304,7 @@ def calculate_news_score(
     """
     keyword_score, keyword_hits, detail = _keyword_score(articles)
     llm_score_val, llm_summary          = _llm_score(
-        articles, company_name, openai_api_key, openai_model
+        articles, company_name, llm_api_key, llm_model
     )
     final_score = _merge_scores(keyword_score, llm_score_val, keyword_hits)
 
@@ -318,7 +312,14 @@ def calculate_news_score(
     detail["keyword_score"]   = round(keyword_score, 2)
     detail["llm_score"]       = llm_score_val
     detail["keyword_hits"]    = keyword_hits
+    if not llm_api_key:
+        detail["llm_status"] = "미호출(키 없음)"
+    elif llm_score_val is None:
+        detail["llm_status"] = "실패"
+    else:
+        detail["llm_status"] = "성공"
     detail["merge_weights"]   = (
+        "키워드만 (LLM 미반영)" if llm_score_val is None else
         "7:3" if keyword_hits >= 3 else
         "5:5" if keyword_hits >= 1 else
         "3:7"
@@ -342,8 +343,8 @@ def news_node(state: dict) -> dict:
     company_name    = state["company_name"]
     naver_id        = state.get("naver_client_id", "") or os.environ.get("NAVER_NEWS_API_Client_ID", "").strip()
     naver_secret    = state.get("naver_client_secret", "") or os.environ.get("NAVER_NEWS_API_Client_Secret", "").strip()
-    openai_api_key  = state.get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
-    openai_model    = state.get("openai_model", "") or os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+    llm_api_key  = state.get("llm_api_key", "") or get_llm_api_key()
+    llm_model    = state.get("llm_model", "") or get_llm_model()
     errors          = list(state.get("errors", []))
 
     logger.info("[News] %s 분석 시작", company_name)
@@ -376,6 +377,7 @@ def news_node(state: dict) -> dict:
                 llm_score=None,
                 llm_summary="",
                 merge_weights="",
+                llm_status="미호출(뉴스 없음)",
             ),
             "news_data":    [],
             "news_score":   None,   # SupervisoryReviewAgent가 news_data_missing으로 처리
@@ -386,7 +388,7 @@ def news_node(state: dict) -> dict:
 
     # ── 점수 계산 ─────────────────────────────
     final_score, detail, llm_summary = calculate_news_score(
-        news_data, company_name, openai_api_key, openai_model
+        news_data, company_name, llm_api_key, llm_model
     )
 
     negative_keywords = list({*detail.get("neg_high", []), *detail.get("neg_mid", [])})
@@ -396,6 +398,9 @@ def news_node(state: dict) -> dict:
         negative_keywords=negative_keywords,
         negative_critical_event=bool(detail.get("neg_high", [])),
         missing_news=False,
+        negative_high_keywords=list(detail.get("neg_high", [])),
+        negative_mid_keywords=list(detail.get("neg_mid", [])),
+        llm_status=detail.get("llm_status", ""),
         keyword_score=detail.get("keyword_score"),
         keyword_hits=detail.get("keyword_hits", 0),
         llm_score=detail.get("llm_score"),

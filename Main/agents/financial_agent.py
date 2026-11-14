@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import logging
 
-from models.schemas import BioAgentState, FinancialResult
+from models.schemas import BioAgentState, CashRunwayStatus, FinancialResult
 
 logger = logging.getLogger(__name__)
+
+# 데이터가 없을 때 부여하는 중립 점수 (각 항목 배점 범위의 중간값)
+NEUTRAL_RD_SCORE = 5.5       # R&D 배점 1~10
+NEUTRAL_OCF_SCORE = 8.5      # 영업현금흐름 배점 2~15
+NEUTRAL_RUNWAY_SCORE = 2.5   # Cash Runway 배점 0~5
 
 
 class FinancialAgent:
@@ -47,10 +52,13 @@ class FinancialAgent:
             opm_score = 5.0
         else:
             opm_score = 2.0
-            if fd.rd_expense_ratio < 20.0:
+            if fd.rd_expense_ratio is None or fd.rd_expense_ratio < 20.0:
                 risk_factors.append(f"영업적자 심화 (영업이익률 {fd.operating_profit_margin:.1f}%)")
 
-        if fd.operating_cash_flow >= 500:
+        if fd.operating_cash_flow is None:
+            ocf_score = NEUTRAL_OCF_SCORE
+            risk_factors.append("영업현금흐름 데이터 확인 불가")
+        elif fd.operating_cash_flow >= 500:
             ocf_score = 15.0
         elif fd.operating_cash_flow >= 200:
             ocf_score = 11.0
@@ -70,7 +78,10 @@ class FinancialAgent:
             ca_score = 2.0
             risk_factors.append(f"현금성 자산 부족 ({fd.cash_assets:.0f}억원)")
 
-        if fd.rd_expense_ratio >= 20.0:
+        if fd.rd_expense_ratio is None:
+            rd_score = NEUTRAL_RD_SCORE
+            risk_factors.append("R&D 데이터 확인 불가")
+        elif fd.rd_expense_ratio >= 20.0:
             rd_score = 10.0
         elif fd.rd_expense_ratio >= 10.0:
             rd_score = 7.0
@@ -80,10 +91,20 @@ class FinancialAgent:
             rd_score = 1.0
             risk_factors.append(f"R&D 투자 부족 (R&D 비중 {fd.rd_expense_ratio:.1f}%)")
 
-        if fd.cash_runway_months >= 24:
+        runway_status = fd.runway_status
+        runway_ok = False  # 12개월 이상 버틸 수 있는지 (보정 가점 조건)
+        if runway_status == CashRunwayStatus.NO_BURN:
             runway_score = 5.0
+            runway_ok = True
+        elif runway_status == CashRunwayStatus.UNKNOWN or fd.cash_runway_months is None:
+            runway_score = NEUTRAL_RUNWAY_SCORE
+            risk_factors.append("Cash Runway 데이터 확인 불가")
+        elif fd.cash_runway_months >= 24:
+            runway_score = 5.0
+            runway_ok = True
         elif fd.cash_runway_months >= 12:
             runway_score = 3.0
+            runway_ok = True
         elif fd.cash_runway_months >= 6:
             runway_score = 1.0
         else:
@@ -94,14 +115,14 @@ class FinancialAgent:
 
         has_protection = False
         if fd.operating_profit_margin < 0 and clinical_stage in ["Phase 1", "Phase 2", "Phase 3", "Preclinical"]:
-            if fd.rd_expense_ratio >= 20.0 and fd.cash_runway_months >= 12:
+            if fd.rd_expense_ratio is not None and fd.rd_expense_ratio >= 20.0 and runway_ok:
                 has_protection = True
                 base_score += 5.0
                 logger.info(
-                    "[FinancialAgent] %s | 기술 성장성 보정 가점 적용 (+5.0점) - R&D 비중: %.1f%%, Runway: %.1f개월",
+                    "[FinancialAgent] %s | 기술 성장성 보정 가점 적용 (+5.0점) - R&D 비중: %.1f%%, Runway: %s",
                     company_name,
                     fd.rd_expense_ratio,
-                    fd.cash_runway_months,
+                    fd.runway_text,
                 )
 
         financial_score = max(0.0, min(100.0, base_score))

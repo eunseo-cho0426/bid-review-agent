@@ -26,6 +26,7 @@ import json
 import logging
 import os
 from typing import Dict, List, Optional, Tuple
+from services.llm_client import get_chat_model, get_llm_api_key, get_llm_model, message_text
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ def _detect_special_cases(state: dict) -> List[str]:
         cases.append("news_data_missing")
     if bio_score is None:
         cases.append("bio_data_missing")
+    if state.get("disclosure_data_missing"):
+        cases.append("disclosure_data_missing")
 
     # ── 점수 간 모순 ──────────────────────────
     if (
@@ -133,8 +136,8 @@ def _llm_judge(
     state: dict,
     current_grade: str,
     special_cases: List[str],
-    openai_api_key: str,
-    openai_model: str,
+    llm_api_key: str,
+    llm_model: str,
 ) -> Tuple[Optional[str], str]:
     """
     LLM에게 등급 조정 여부를 판단하게 한다.
@@ -150,6 +153,8 @@ def _llm_judge(
         f"뉴스 점수: {state.get('news_score', 'N/A')}\n"
         f"바이오 점수: {state.get('bio_domain_score', state.get('bio_score', 'N/A'))}\n"
         f"공시 점수: {state.get('disclosure_score', 'N/A')}"
+        + (" (공시 조회 실패로 MEDIUM 임시 반영 — 실제 공시 리스크 미확인)"
+           if state.get("disclosure_data_missing") else "")
     )
 
     news_detail  = state.get("news_detail", {})
@@ -180,15 +185,9 @@ def _llm_judge(
     )
 
     try:
-        from langchain_openai import ChatOpenAI
-
-        llm = ChatOpenAI(
-            model=openai_model,
-            openai_api_key=openai_api_key,
-            temperature=0.1,
-        )
+        llm = get_chat_model(api_key=llm_api_key, model=llm_model, temperature=0.1)
         result  = llm.invoke(prompt)
-        content = result.content.strip()
+        content = message_text(result).strip()
 
         if content.startswith("```"):
             content = content.split("```")[1]
@@ -213,8 +212,8 @@ def _llm_judge_with_retry(
     state: dict,
     current_grade: str,
     special_cases: List[str],
-    openai_api_key: str,
-    openai_model: str,
+    llm_api_key: str,
+    llm_model: str,
     errors: List[str],
 ) -> Tuple[Optional[str], str, bool]:
     """
@@ -229,7 +228,7 @@ def _llm_judge_with_retry(
 
     for retry in range(1, MAX_RETRY + 1):
         adjusted_grade, reason = _llm_judge(
-            state, current_grade, special_cases, openai_api_key, openai_model
+            state, current_grade, special_cases, llm_api_key, llm_model
         )
 
         # LLM 호출 자체 실패
@@ -302,10 +301,46 @@ def _needs_human_review(
 def supervisory_review_node(state: dict) -> dict:
     """LangGraph 노드 — B/C 등급만 처리하고 나머지는 패스."""
     current_grade  = state.get("loan_grade", "")
-    openai_api_key = state.get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
-    openai_model   = state.get("openai_model", "") or os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+    llm_api_key = state.get("llm_api_key", "") or get_llm_api_key()
+    llm_model   = state.get("llm_model", "") or get_llm_model()
     company_name   = state.get("company_name", "")
     errors         = list(state.get("errors", []))
+
+    # ── 공시 리스크 HIGH → A·B·C 모두 LLM 없이 전문가 검토 (D·E는 아래에서 그대로 부결) ──
+    if current_grade in ("A", "B", "C") and state.get("disclosure_risk_level") == "HIGH":
+        titles = state.get("disclosure_high_titles") or []
+        reason = (
+            "공시 리스크 HIGH — 중대 공시 감지: " + ", ".join(titles)
+            if titles else "공시 리스크 HIGH — 중대 공시 감지"
+        ) + " → LLM 판단 없이 전문가 검토로 전달"
+        logger.info("[Supervisory] %s — %s등급, %s", company_name, current_grade, reason)
+        return {
+            "supervisory_result": {
+                "original_grade": current_grade,
+                "special_cases":  ["disclosure_high_risk"],
+                "llm_called":     False,
+                "adjusted_grade": current_grade,
+                "reason":         reason,
+            },
+            "needs_human_review": True,
+            "errors": errors,
+        }
+
+    # ── A등급인데 공시 조회 실패 → 숨은 공시 리스크를 확인할 수 없으므로 전문가 검토 ──
+    #    (D/E는 공시 리스크가 더 있어도 부결 결론이 바뀌지 않으므로 그대로 둔다)
+    if current_grade == "A" and state.get("disclosure_data_missing"):
+        logger.info("[Supervisory] %s — A등급, 공시 조회 실패 → 전문가 검토", company_name)
+        return {
+            "supervisory_result": {
+                "original_grade": current_grade,
+                "special_cases":  ["disclosure_data_missing"],
+                "llm_called":     False,
+                "adjusted_grade": current_grade,
+                "reason":         "공시 조회 실패 — 공시 리스크를 확인할 수 없어 전문가 검토로 전달",
+            },
+            "needs_human_review": True,
+            "errors": errors,
+        }
 
     # ── B, C 아니면 패스 ─────────────────────
     if current_grade not in ("B", "C"):
@@ -351,7 +386,7 @@ def supervisory_review_node(state: dict) -> dict:
     # ── special_case 있는 경우 → LLM 판단 (재시도 포함) ───
     adjusted_grade, reason, is_error = _llm_judge_with_retry(
         state, current_grade, special_cases,
-        openai_api_key, openai_model, errors,
+        llm_api_key, llm_model, errors,
     )
 
     # 오류 발생 시 → 재시작 또는 Human Review 강제 전달

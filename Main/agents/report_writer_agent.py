@@ -13,7 +13,7 @@ import logging
 from models.schemas import (
     BioAgentState, CompanyReport, GradeEnum, DisclosureRiskLevel, FinalDecision
 )
-from services.openai_client import get_openai_client
+from services.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,9 @@ DECISION_LABEL = {
     FinalDecision.REJECTED:          "부결",
     FinalDecision.HUMAN_IN_THE_LOOP: "Human-in-the-Loop (전문가 검토 필요)",
 }
+
+# Gemini 자연어 보고서를 쓰는 등급 (그 외 등급·부결 기업은 템플릿 보고서)
+LLM_REPORT_GRADES = {GradeEnum.A, GradeEnum.B, GradeEnum.C}
 
 
 class ReportWriterAgent:
@@ -74,6 +77,9 @@ class ReportWriterAgent:
             "domain_risks":       domain_risks,
             "bio_summary":        bio_summary,
             "disc_level":         disc_level,
+            "disc_lookup_failed": dr.lookup_failed if dr else False,
+            "neg_high":           nr.negative_high_keywords if nr else [],
+            "neg_mid":            nr.negative_mid_keywords if nr else [],
             "original_grade":     original_grade,
             "adjusted_grade":     adjusted_grade,
             "supervisory_reason": supervisory_reason,
@@ -84,7 +90,20 @@ class ReportWriterAgent:
             "restart_history":    restart_history,
         }
 
-        report_text = self._build_report(report_data)
+        report_text, report_llm_status = self._build_report(report_data)
+
+        # ── LLM 호출 결과 (뉴스 · Supervisory · 보고서) ──
+        if svr is None or not svr.llm_called:
+            sup_status = "미호출(특이사항 없음)" if not (svr and svr.flags) else "미호출(규칙 처리)"
+        elif svr.is_error:
+            sup_status = "실패"
+        else:
+            sup_status = "성공" + (" (재시작 후)" if state.restart_count else "")
+        llm_status = {
+            "news":        (nr.llm_status if nr and nr.llm_status else "미호출"),
+            "supervisory": sup_status,
+            "report":      report_llm_status,
+        }
 
         state.report = CompanyReport(
             company_id           = company.company_id,
@@ -95,7 +114,7 @@ class ReportWriterAgent:
             news_score           = round(news_score, 2) if news_score is not None else None,
             bio_score            = round(bio_domain_score, 2),
             disclosure_risk_level= disc_level,
-            special_case         = llm_called,
+            special_case         = svr.special_case if svr else False,
             special_case_reason  = supervisory_reason,
             final_decision       = decision,
             decision_reason      = decision_reason,
@@ -112,6 +131,15 @@ class ReportWriterAgent:
             bio_domain_risks     = domain_risks,
             bio_domain_summary   = bio_summary,
             disclosure_detected_keywords= dr.detected_keywords if dr else [],
+            disclosure_matched   = dr.matched_disclosures if dr else [],
+            disclosure_data_errors= dr.data_errors if dr else [],
+            disclosure_lookup_failed= dr.lookup_failed if dr else False,
+            rd_expense_text      = company.financial.rd_text,
+            rd_source_text       = company.financial.rd_source_text,
+            cash_runway_text     = company.financial.runway_text,
+            news_negative_high_keywords= nr.negative_high_keywords if nr else [],
+            news_negative_mid_keywords = nr.negative_mid_keywords if nr else [],
+            llm_status           = llm_status,
         )
 
         logger.info(
@@ -120,8 +148,8 @@ class ReportWriterAgent:
         )
         return state
 
-    def _build_report(self, data: dict) -> str:
-        """보고서 생성 — OpenAI 가용 시 자연어, 불가 시 템플릿."""
+    def _build_report(self, data: dict) -> tuple[str, str]:
+        """보고서 생성 — LLM 가용 시 자연어, 불가 시 템플릿. (본문, LLM 상태)를 반환."""
 
         name               = data["name"]
         grade              = data["grade"]
@@ -143,6 +171,12 @@ class ReportWriterAgent:
         restart_history    = data["restart_history"]
 
         news_str     = f"{news_score:.1f}점" if news_score is not None else "데이터 없음 (판단 불확실)"
+        neg_high_str = ", ".join(data["neg_high"]) or "없음"
+        neg_mid_str  = ", ".join(data["neg_mid"]) or "없음"
+        disc_str     = (
+            f"{disc_level.value} (공시 조회 실패 — 공시 리스크 미확인)"
+            if data["disc_lookup_failed"] else disc_level.value
+        )
         decision_str = DECISION_LABEL[decision]
 
         # 등급 조정 여부
@@ -170,10 +204,12 @@ class ReportWriterAgent:
             f"재무 점수       : {fin_score:.1f}점\n"
             f"재무 리스크     : {', '.join(risk_factors) if risk_factors else '없음'}\n"
             f"뉴스 점수       : {news_str}\n"
+            f"강한 부정 뉴스  : {neg_high_str}\n"
+            f"중간 부정 뉴스  : {neg_mid_str}\n"
             f"바이오 점수     : {bio_domain_score:.1f}점\n"
             f"바이오 리스크   : {', '.join(domain_risks) if domain_risks else '없음'}\n"
             f"바이오 요약     : {bio_summary or '없음'}\n"
-            f"공시 리스크     : {disc_level.value}\n"
+            f"공시 리스크     : {disc_str}\n"
             f"특이사항 검토   : {'있음' if llm_called else '없음'}\n"
             f"특이사항 사유   : {supervisory_reason or '해당 없음'}\n"
             f"재시작 이력     : {restart_str}\n"
@@ -182,10 +218,14 @@ class ReportWriterAgent:
             f"판단 근거       : {decision_reason}\n"
         )
 
-        # ── OpenAI 자연어 보고서 ──────────────────
-        openai = get_openai_client()
-        if not openai.is_available():
-            return template
+        # ── Gemini 자연어 보고서 ──────────────────
+        # D·E 등급 또는 부결 기업은 LLM 없이 템플릿 보고서 (Gemini 쿼터 절약)
+        if grade not in LLM_REPORT_GRADES or decision == FinalDecision.REJECTED:
+            return template, "미호출(D/E·부결 → 템플릿)"
+
+        llm = get_llm_client()
+        if not llm.is_available():
+            return template, "미호출(키 없음)"
 
         prompt = (
             f"당신은 바이오 기업 여신 심사 보고서 작성 전문 AI입니다.\n"
@@ -195,9 +235,10 @@ class ReportWriterAgent:
             f"최종 점수: {final_score:.2f}점\n"
             f"재무 점수: {fin_score:.1f}점 | 뉴스 점수: {news_str} | 바이오 점수: {bio_domain_score:.1f}점\n"
             f"재무 리스크: {', '.join(risk_factors) if risk_factors else '없음'}\n"
+            f"뉴스 부정 키워드: 강한 부정 [{neg_high_str}] / 중간 부정 [{neg_mid_str}]\n"
             f"바이오 리스크: {', '.join(domain_risks) if domain_risks else '없음'}\n"
             f"바이오 요약: {bio_summary or '없음'}\n"
-            f"공시 리스크: {disc_level.value}\n"
+            f"공시 리스크: {disc_str}\n"
             f"등급 조정 사유: {supervisory_reason or '조정 없음'}\n"
             f"재시작 이력: {restart_str}\n"
             f"오류 여부: {error_str}\n"
@@ -208,12 +249,12 @@ class ReportWriterAgent:
             f"재시작 이력이나 오류가 있으면 신뢰도 한계를 명시하세요."
         )
 
-        ai_text = openai.generate(prompt)
+        ai_text = llm.generate(prompt)
         if ai_text:
             return (
                 f"■ {name} 여신심사 최종 보고서\n"
                 f"{'=' * 50}\n"
                 f"{ai_text}\n\n"
                 f"[원본 데이터]\n{template}"
-            )
-        return template
+            ), "성공"
+        return template, "실패(템플릿 사용)"

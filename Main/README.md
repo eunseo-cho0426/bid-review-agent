@@ -1,134 +1,216 @@
 # BioCredit Agent
 
-코스닥 바이오·제약 기업 특화 **여신 심사 의사결정 지원 AI 시스템**
+코스닥 바이오·제약 기업 특화 **여신 심사 의사결정 지원 Agentic AI**
 
-LangGraph 9-Agent 파이프라인으로 재무·뉴스·바이오 도메인·공시 리스크를 종합 분석하고,  
-A~E 등급을 산출하여 승인 / 부결 / Human-in-the-Loop를 자동 판정합니다.
+재무제표만으로는 평가하기 어려운 바이오 기업을 재무·뉴스·임상/특허·공시 데이터로 나눠 분석하고, A~E 등급과 **승인 / 전문가 검토 / 부결** 판단, 기업별 심사 보고서를 자동으로 만듭니다.
 
----
+> "바이오 기업은 적자라고 무조건 위험하지 않고, 흑자라고 무조건 안전하지 않다."
 
-## 폴더 구조
-
-```
-biocredit_agent/
-├── app.py                        # FastAPI 앱 + LangGraph 워크플로우
-├── agents/
-│   ├── planner_agent.py          # 1. 분석 계획 수립
-│   ├── financial_agent.py        # 2. 재무 점수 산출
-│   ├── news_agent.py             # 3. 뉴스 키워드 분석
-│   ├── bio_domain_agent.py       # 4. 바이오 도메인 점수
-│   ├── disclosure_agent.py       # 5. 공시 리스크 판정
-│   ├── risk_scoring_agent.py     # 6. 가중 합산 점수·등급
-│   ├── supervisory_review_agent.py  # 7. 관리·감독 특이사항 감지
-│   ├── loan_decision_agent.py    # 8. 최종 여신 판단
-│   └── report_writer_agent.py   # 9. 보고서 생성
-├── data/
-│   └── mock_companies.py         # 인메모리 Mock 기업 데이터 (7개사)
-├── services/
-│   └── openai_client.py          # OpenAI API 클라이언트
-├── models/
-│   └── schemas.py                # Pydantic 데이터 모델
-├── requirements.txt
-├── .env.example
-└── README.md
-```
+- APPS(Agentic AI 학회) 2팀 · 3인 (조은서, 장현준, 박종빈) · 2026.05 ~ 2026.06, 2026.11 실행 환경 개선
+- Python · LangGraph · FastAPI · Google Gemini · Open DART · 네이버 뉴스 · ClinicalTrials.gov · KIPRIS Plus
 
 ---
 
-## 설치 방법
+## 1. 동작 개요
+
+```
+[대상 선정] KRX 상장종목 업종표 → 코스닥 바이오·제약 4개 업종 → 시가총액 상위 N개
+     │        (LLM 호출 없음)
+     ▼
+[데이터 수집] DART 재무제표·사업보고서·공시목록 / 네이버 뉴스 / ClinicalTrials.gov / KIPRIS
+     │
+     ▼
+[9-Agent 파이프라인, LangGraph]
+ planner → financial → news → bio_domain → disclosure → risk_scoring
+        → supervisory ──(LLM 판단 실패 시 1회 재분석)──→ planner
+                     └→ loan_decision → report_writer → END
+```
+
+분석 대상 업종(KSIC, `BIO_INDUSTRIES`로 변경 가능)
+
+- 의약품 제조업 · 기초 의약물질 제조업 · 의료용품 및 기타 의약 관련제품 제조업 · 자연과학 및 공학 연구개발업
+- KOSDAQ GLOBAL 종목(예: 알테오젠)도 포함
+- 업종표를 불러오지 못하면 비바이오 기업이 섞이지 않도록 분석을 진행하지 않습니다.
+
+---
+
+## 2. Agent별 역할
+
+| # | Agent | 역할 | LLM |
+|---|---|---|---|
+| 1 | Planner | 입력 데이터 누락 확인, 재분석 시 이전 결과 초기화 | - |
+| 2 | Financial | 재무 7개 지표 점수화(0~100) + 바이오 특화 보정 | - |
+| 3 | News | 네이버 뉴스 키워드 점수 + LLM 맥락 점수 병합 | Gemini 1회 |
+| 4 | Bio Domain | 임상 단계·건수·상태 + 특허 수 점수화(0~100) | - |
+| 5 | Disclosure | 최근 1년 DART 공시 제목을 1건씩 분류 → LOW / MEDIUM / HIGH | - |
+| 6 | Risk Scoring | 가중 합산 → 최종 점수와 A~E 등급 | - |
+| 7 | Supervisory Review | B·C 등급의 특이 케이스 감지 → LLM 등급 재검토 | 특이 케이스 있을 때만 |
+| 8 | Loan Decision | 승인 / 전문가 검토 / 부결 | - |
+| 9 | Report Writer | 담당자용 심사 보고서 (A·B·C는 LLM, D·E·부결은 템플릿) | A·B·C만 |
+
+### Financial Agent (재무 40%)
+
+| 지표 | 배점 | 바이오 관점 해석 |
+|---|---|---|
+| 유동비율 | 20 | 단기 운전자금 상환 능력 |
+| 부채비율 | 20 | 재무 구조 안정성 |
+| 영업이익률 | 15 | 상업화 기업 vs 연구개발 중심 기업 구분 |
+| 영업현금흐름 | 15 | 적자 기업의 생존 가능성 |
+| 현금성 자산 | 15 | 임상 지연 시 버퍼 |
+| R&D 비중 | 10 | 성장성이자 현금 소진 위험 |
+| Cash Runway | 5 | 보유 현금 ÷ 월 현금 소진액 |
+
+- **계획된 적자 보정 (+5점)**: 영업적자이면서 R&D 비중 20% 이상, Runway 12개월 이상(또는 현금 소진 없음)
+- **데이터 결측 처리**: R&D·영업현금흐름·Runway를 찾지 못하면 임의 기본값 대신 해당 배점의 중간값을 주고 `확인 불가` 위험 요인으로 기록
+- **R&D 비중 출처**: ① 재무제표 API → ② 사업보고서 '연구개발활동' 표의 연구개발비/매출액 비율 → ③ 재무제표 주석 '연구개발비의 기능별 배분' ÷ 매출액
+- **Cash Runway**: 영업현금흐름 음수일 때만 개월 수 계산, 0 이상이면 `현금 소진 없음`, 값이 없으면 `데이터 없음`
+
+### News Agent (뉴스 25%)
+
+- 네이버 뉴스 검색 API(NCP API Hub)로 최신 기사 수집
+- 바이오 특화 키워드 사전: 강한 부정(임상 실패, FDA 거절, 횡령, 상장폐지 등) / 중간 부정(임상 지연, 계약 해지, 소송 등) / 긍정(FDA 승인, 기술수출, 품목허가 등)
+- 최신성 가중치 `exp(-0.03 × 경과일)` 적용
+- Gemini가 헤드라인 맥락을 0~100점으로 평가 → 키워드 적중 수에 따라 7:3 / 5:5 / 3:7로 병합 (LLM 실패 시 키워드 점수만)
+- 뉴스가 없으면 중립 50점 + `missing_news` 표시
+
+### Bio Domain Agent (바이오 25%)
+
+| 요소 | 점수 |
+|---|---|
+| 최고 임상 단계 (ClinicalTrials.gov) | 3상 30 / 2상 22 / 1상 12 / 전임상 3 |
+| 임상 건수 | 7건 이상 20 / 4~6건 16 / 2~3건 12 / 1건 6 |
+| 임상 상태 | 진행 중 +10 (없으면 완료 +8), 중단 있으면 −15 |
+| 특허 (KIPRIS Plus) | 등록 11건 이상 25 / 6~10건 20 / 3~5건 15 / 1~2건 10 (등록 0건이면 출원 기준 최대 15) |
+
+- 회사명 + 영문명·파이프라인명 별칭(`data/company_aliases.py`)으로 검색
+
+### Disclosure Agent (공시 10%)
+
+- DART 공시목록 최근 1년(최대 500건)의 **제목을 1건씩** 검사
+- HIGH: 관리종목, 상장폐지, 거래정지, 감사의견, 횡령, 배임, 회생절차, 불성실공시법인 **지정 확정**, 영업정지
+- MEDIUM: 불성실공시 지정예고, 유상증자 반복(서로 다른 날짜 2건 이상), 최대주주 변경, 소송
+- 제외: `해제`·`철회`·`미지정`·`정정`이 붙은 공시, 무상증자·액면분할·주식병합·이전상장·신주상장 등 기술적 매매거래정지
+- 점수: LOW 100 / MEDIUM 60 / HIGH 20
+- **공시 조회 실패 시** LOW로 두지 않고 MEDIUM(60점) + `disclosure_data_missing` 특이 케이스 → 전문가 검토
+- 상세 페이지에 걸린 공시 제목·날짜·반영/제외 사유를 표로 표시
+
+### Risk Scoring · 등급
+
+```
+최종 점수 = 재무 × 0.40 + 뉴스 × 0.25 + 바이오 × 0.25 + 공시 × 0.10
+```
+
+| 등급 | 점수 |
+|---|---|
+| A | 85 이상 |
+| B | 70 ~ 85 |
+| C | 55 ~ 70 |
+| D | 40 ~ 55 |
+| E | 40 미만 |
+
+### Supervisory Review Agent
+
+- 대상: B·C 등급 (A 등급은 공시 조회 실패 시에만 전문가 검토)
+- 특이 케이스 감지 (규칙 기반)
+  - 데이터 누락: 뉴스·바이오·공시
+  - 점수 모순: 재무↔뉴스, 바이오↔재무 차이 30점 이상
+  - 치명적 리스크: 강한 부정 키워드, LLM 요약의 치명적 표현, 뉴스 점수 30 이하
+- 특이 케이스가 없으면 B는 자동 승인, C는 전문가 검토
+- 있으면 Gemini가 허용 범위 안에서 등급 재판단 (B → A~D, C → B~E), 범위 밖 응답은 최대 2회 재시도 → 실패 시 전체 1회 재분석 → 그래도 실패하면 전문가 검토
+
+### Loan Decision
+
+| 조건 | 판단 |
+|---|---|
+| 특이 케이스 있음 또는 C 등급 | 전문가 검토 (HUMAN_IN_THE_LOOP) |
+| A · B 등급 | 승인 |
+| D · E 등급 | 부결 |
+
+---
+
+## 3. 설치 · 실행
 
 ```bash
-cd biocredit_agent
+cd Main
 pip install -r requirements.txt
+cp .env.example .env      # 키 입력
+python app.py             # http://127.0.0.1:8000
+```
+
+1. 브라우저에서 대시보드 접속 → 우측 상단 **분석 시작** 클릭
+2. 분석이 끝나면 결과가 `.cache/saved_reports.json`에 저장됩니다.
+3. 다음 실행부터 `USE_SAVED_REPORTS=true`로 켜면 LLM 호출 없이 저장된 결과를 바로 보여줍니다. (시연용, 이때는 **분석 시작**을 누르지 마세요)
+
+### 환경변수 (`.env`)
+
+| 변수 | 설명 |
+|---|---|
+| `GEMINI_API_KEY` | Google AI Studio 키 |
+| `GEMINI_MODEL` | 기본 `gemini-2.5-flash-lite` |
+| `DART_API_KEY` | Open DART 인증키 |
+| `KIPRIS_API_KEY` / `KIPRIS_API_URL` | KIPRIS Plus 키와 출원인 검색 엔드포인트 |
+| `NAVER_CLIENT_ID` / `NAVER_CLIENT_SECRET` | 네이버 클라우드 API Hub 뉴스 검색 키 |
+| `KOSDAQ_TOP_LIMIT` | 분석 기업 수 (기본 50) |
+| `BIO_INDUSTRIES` | 분석 업종 (쉼표 구분, 선택) |
+| `USE_SAVED_REPORTS` | `true`면 저장된 결과 불러오기 |
+
+> Gemini 무료 등급은 일일 요청 수가 적어 5개사 1회 분석(약 12회 호출)이 한계에 가깝습니다. 50개사 분석은 유료 플랜이 필요합니다.
+
+### 화면 · API
+
+| 경로 | 설명 |
+|---|---|
+| `GET /` | 대시보드 (A·B·C 메인 표, 부결·D·E는 접이식 패널) |
+| `GET /companies/{종목코드}` | 기업 상세 (점수 근거, 공시 근거 표, R&D 출처, LLM 호출 상태, 보고서) |
+| `POST /api/start` | 분석 시작 |
+| `GET /api/status` | 진행 상황 |
+| `GET /api/companies` · `/api/companies/{종목코드}` | 결과 JSON |
+
+---
+
+## 4. 폴더 구조
+
+```
+Main/
+├── app.py                     # FastAPI + LangGraph 그래프 + 대시보드, 결과 저장/불러오기
+├── agents/                    # 9개 Agent
+├── services/
+│   ├── llm_client.py          # Gemini 공용 클라이언트
+│   ├── dart_client.py         # 재무제표·사업보고서(R&D)·공시목록
+│   ├── market_client.py       # KRX 업종 필터 + 시가총액 순위
+│   ├── clinical_trials_client.py
+│   └── patent_client.py       # KIPRIS Plus
+├── data/
+│   ├── company_loader.py      # 분석 대상 기업 구성
+│   └── company_aliases.py     # 임상·특허 검색용 별칭
+├── models/schemas.py          # Pydantic 모델
+├── scheduler/market.py        # 산업 환경 분석 (현재 파이프라인 미연결)
+└── BioCredit_Agent_기획서.docx
 ```
 
 ---
 
-## 실행 방법
+## 5. 실행 결과 예시 (2026.11.14, 코스닥 바이오·제약 시총 상위 5개사)
 
-```bash
-# 방법 1: 직접 실행
-python app.py
+| 기업 | 등급 | 최종 | 재무 / 뉴스 / 바이오 | 공시 | 판단 |
+|---|---|---|---|---|---|
+| 파마리서치 | B | 81.78 | 76.0 / 84.5 / 81.0 | LOW | 승인 |
+| 알테오젠 | B | 81.45 | 78.0 / 82.0 / 79.0 | LOW | 승인 |
+| 휴젤 | B | 75.08 | 73.0 / 89.5 / 70.0 | MEDIUM (최대주주 변경) | 승인 |
+| 삼천당제약 | C | 65.08 | 58.0 / 89.5 / 70.0 | HIGH (불성실공시법인 지정) | 전문가 검토 |
+| HLB | C | 60.40 | 31.0 / 82.0 / 70.0 | LOW | 전문가 검토 |
 
-# 방법 2: uvicorn
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-브라우저에서 `http://localhost:8000` 접속
-
----
-
-## 환경변수 설정
-
-`.env.example`을 복사하여 `.env`를 생성하고 키를 입력합니다:
-
-```
-OPENAI_API_KEY=your_api_key_here
-OPENAI_MODEL=gpt-5.4-mini
-```
-
-- `OPENAI_API_KEY`: OpenAI Platform에서 발급 (없어도 앱 정상 동작)
-- `OPENAI_MODEL`: 사용할 OpenAI 모델 (기본값: gpt-5.4-mini)
+- HLB: 재무 31점(유동비율 0.36, Cash Runway 5.3개월)이지만 R&D 비중 71%·임상 3상 근거로 부결이 아닌 전문가 검토. 재무↔뉴스·바이오 점수 모순을 Supervisory가 감지해 LLM 재검토 후 C 유지
+- 삼천당제약: 불성실공시법인 지정(2026.04) 확정으로 공시 HIGH, 재무↔뉴스 31.5점 차이로 LLM 재검토 후 C 유지
 
 ---
 
-## 주요 Agent 설명
+## 6. 한계 · 개선 예정
 
-| Agent | 역할 |
-|-------|------|
-| **PlannerAgent** | 분석 대상 기업 목록 정리, 누락 데이터 확인 |
-| **FinancialAgent** | 유동비율·부채비율·영업현금흐름·현금성자산·Cash Runway → 재무점수(0~100) |
-| **NewsAgent** | 긍/부정 키워드 분석 → 뉴스점수(0~100), 뉴스 없으면 None(판단 불확실) |
-| **BioDomainAgent** | 임상단계·파이프라인·기술수출·특허·의존도 → 바이오점수(0~100) |
-| **DisclosureAgent** | 공시 리스크 문구 → LOW / MEDIUM / HIGH |
-| **RiskScoringAgent** | 가중합산(재무40+뉴스25+바이오25+공시10) → 최종점수 + A~E 등급 |
-| **SupervisoryReviewAgent** | 점수 간 모순·데이터 누락·치명적 리스크 감지 → special_case 판정 |
-| **LoanDecisionAgent** | 등급 + special_case 기반 최종 판단 |
-| **ReportWriterAgent** | OpenAI AI 또는 템플릿 기반 한국어 보고서 생성 |
-
----
-
-## 최종 판단 로직
-
-```
-1. special_case == True  →  HUMAN_IN_THE_LOOP
-2. grade == "C"          →  HUMAN_IN_THE_LOOP
-3. grade in ["A", "B"]   →  APPROVED
-4. grade in ["D", "E"]   →  REJECTED
-```
-
-**special_case 감지 조건 (하나라도 해당 시)**
-
-| 조건 | 설명 |
-|------|------|
-| a | 재무점수≤50 AND 뉴스점수≥75 (점수 간 모순) |
-| b | 재무점수≥75 AND 뉴스데이터 없음 |
-| c | 재무·뉴스·바이오 점수 간 최대 편차 ≥35점 |
-| d | 횡령·상장폐지·감사의견거절 등 치명적 이벤트 |
-| e | 뉴스 없음 + A/B등급 (고등급 신뢰도 부족) |
-| f | 공시리스크 HIGH |
-
----
-
-## Mock 데이터 케이스
-
-| 기업 | 예상 등급 | 최종 판단 | 설명 |
-|------|----------|----------|------|
-| 셀트리온바이오 | A | 승인 | FDA 승인, 기술수출, 우수 재무 |
-| 한미바이오텍 | B | 승인 | 특허·임상 3상, 안정적 재무 |
-| 메디파마솔루션 | C | 전문가 검토 | 경계 구간, 임상 지연 |
-| 이노바이오케어 | D | 부결 | 임상 실패, 현금 부족 |
-| 파마리스크코리아 | E | 부결 | 횡령·감사거절·관리종목 |
-| 뉴로바이오시스 | C→특이 | 전문가 검토 | 재무 낮음+뉴스 좋음 (모순) |
-| 제넥신알파 | B→특이 | 전문가 검토 | 재무 높음+뉴스 없음 |
-
----
-
-## API 엔드포인트
-
-| Method | Path | 설명 |
-|--------|------|------|
-| GET | `/` | 전체 기업 목록 대시보드 (HTML) |
-| GET | `/companies/{company_id}` | 기업 상세 보고서 (HTML) |
-| GET | `/api/companies` | 전체 기업 분석 결과 (JSON) |
-| GET | `/api/companies/{company_id}` | 특정 기업 분석 결과 (JSON) |
+- 규칙 기반 점수화로 설명 가능성을 우선했고, 실제 여신 결과와 비교한 정확도 검증은 하지 않았습니다.
+- 바이오 점수가 대형사에서 상한(임상 7건·특허 11건)에 걸려 변별력이 낮고, 임상 중단은 건수와 무관하게 −15점입니다.
+- 일반 약물명 별칭(예: apatinib, botulinum toxin)은 다른 회사 임상까지 잡을 수 있어 sponsor 기준 매칭이 필요합니다.
+- 기술수출·인허가·파이프라인 의존도는 데이터 모델에만 있고 점수에는 뉴스 키워드로만 간접 반영됩니다.
+- 사업보고서에서 R&D 비율 표를 찾지 못하는 회사가 있을 수 있습니다.
+- 부채비율 산출 계정 매칭 검증 필요 (현금이 많은 기업도 100%를 넘게 계산되는 사례 확인 중)
+- `scheduler/market.py`(산업 환경 분석)는 파이프라인에 아직 연결되지 않았습니다.
