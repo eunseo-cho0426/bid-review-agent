@@ -306,6 +306,26 @@ def supervisory_review_node(state: dict) -> dict:
     company_name   = state.get("company_name", "")
     errors         = list(state.get("errors", []))
 
+    # ── 공시 리스크 HIGH → A·B·C 모두 LLM 없이 전문가 검토 (D·E는 아래에서 그대로 부결) ──
+    if current_grade in ("A", "B", "C") and state.get("disclosure_risk_level") == "HIGH":
+        titles = state.get("disclosure_high_titles") or []
+        reason = (
+            "공시 리스크 HIGH — 중대 공시 감지: " + ", ".join(titles)
+            if titles else "공시 리스크 HIGH — 중대 공시 감지"
+        ) + " → LLM 판단 없이 전문가 검토로 전달"
+        logger.info("[Supervisory] %s — %s등급, %s", company_name, current_grade, reason)
+        return {
+            "supervisory_result": {
+                "original_grade": current_grade,
+                "special_cases":  ["disclosure_high_risk"],
+                "llm_called":     False,
+                "adjusted_grade": current_grade,
+                "reason":         reason,
+            },
+            "needs_human_review": True,
+            "errors": errors,
+        }
+
     # ── A등급인데 공시 조회 실패 → 숨은 공시 리스크를 확인할 수 없으므로 전문가 검토 ──
     #    (D/E는 공시 리스크가 더 있어도 부결 결론이 바뀌지 않으므로 그대로 둔다)
     if current_grade == "A" and state.get("disclosure_data_missing"):

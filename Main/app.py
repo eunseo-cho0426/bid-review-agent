@@ -34,6 +34,7 @@ from agents import (
     planner_node as _planner_node_fn,
     supervisory_review_node,
 )
+from agents.disclosure_agent import HIGH_RISK_KEYWORDS
 from data.company_loader import build_companies_by_id, load_companies
 from services.llm_client import get_llm_api_key, get_llm_model
 from models.schemas import BioAgentState, CompanyData, CompanyReport, GradeEnum, NewsResult, SupervisoryResult
@@ -130,6 +131,19 @@ def risk_scoring_node(state: dict) -> dict:
     return _risk.run(s).model_dump()
 
 
+def _high_risk_disclosure_titles(s: BioAgentState) -> list[str]:
+    """HIGH 등급으로 반영된 공시 제목 → '제목 (YYYY.MM.DD)' 목록."""
+    if not s.disclosure_result:
+        return []
+    titles = []
+    for hit in s.disclosure_result.matched_disclosures:
+        if not hit.applied or hit.keyword not in HIGH_RISK_KEYWORDS:
+            continue
+        date = f"{hit.date[:4]}.{hit.date[4:6]}.{hit.date[6:]}" if len(hit.date) == 8 else hit.date
+        titles.append(f"{hit.title} ({date})" if date else hit.title)
+    return titles
+
+
 def supervisory_node(state: dict) -> dict:
     s = BioAgentState(**state)
     disc_score_map = {"LOW": 100.0, "MEDIUM": 60.0, "HIGH": 20.0}
@@ -145,6 +159,8 @@ def supervisory_node(state: dict) -> dict:
         "bio_score": s.bio_domain_result.bio_domain_score if s.bio_domain_result else None,
         "disclosure_score": disc_score_map.get(disc_level, 60.0),
         "disclosure_data_missing": bool(s.disclosure_result and s.disclosure_result.lookup_failed),
+        "disclosure_risk_level": disc_level,
+        "disclosure_high_titles": _high_risk_disclosure_titles(s),
         # neg_high에는 강한 부정 키워드만, 중간 부정은 neg_mid로 분리해서 전달
         "news_detail": {
             "neg_high": s.news_result.negative_high_keywords if s.news_result else [],
